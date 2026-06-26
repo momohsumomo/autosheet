@@ -1,0 +1,12 @@
+node_modules
+.next
+out
+backend
+venv
+.git
+.gitignore
+.env
+.env.*
+npm-debug.log*
+*.tsbuildinfo
+.DS_Store

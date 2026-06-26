@@ -19,6 +19,14 @@ pnpm-debug.log*
 # python
 __pycache__/
 *.pyc
+venv/
+backend/venv/
+.venv/
+
+# firebase admin service account key
+serviceAccountKey.json
+backend/serviceAccountKey.json
+**/serviceAccountKey*.json
 
 # misc
 .DS_Store

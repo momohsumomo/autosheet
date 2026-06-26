@@ -1,5 +1,7 @@
 import type { Metadata } from "next";
 import "./globals.css";
+import { AuthProvider } from "@/lib/auth-context";
+import AuthGate from "@/components/AuthGate";
 
 export const metadata: Metadata = {
   title: "個人智慧樂譜圖書館",
@@ -11,7 +13,11 @@ export default function RootLayout({
 }: Readonly<{ children: React.ReactNode }>) {
   return (
     <html lang="zh-Hant">
-      <body>{children}</body>
+      <body>
+        <AuthProvider>
+          <AuthGate>{children}</AuthGate>
+        </AuthProvider>
+      </body>
     </html>
   );
 }

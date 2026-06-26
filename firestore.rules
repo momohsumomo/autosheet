@@ -1,0 +1,16 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // 每位使用者的所有資料都在 users/{uid} 之下，結構性隔離。
+    // 前端只能讀「自己的」資料；寫入一律透過後端 Admin SDK（不受規則限制）。
+    match /users/{uid} {
+      allow read: if request.auth != null && request.auth.uid == uid;
+      allow write: if false;
+
+      match /{document=**} {
+        allow read: if request.auth != null && request.auth.uid == uid;
+        allow write: if false;
+      }
+    }
+  }
+}

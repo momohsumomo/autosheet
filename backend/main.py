@@ -1,28 +1,36 @@
-import json
-import os
-import re
-from typing import Any
+"""AI 音樂館員 API（Phase 1：整本樂譜結構切分匯入）。
 
-import fitz
-import google.generativeai as genai
+流程：
+  /import/analyze  上傳混合檔案 -> 轉頁圖 -> 高解析存 Storage -> 縮圖丟 Gemini 切歌
+                   -> 回傳「提議結構」給前端確認（尚未寫 Firestore）。
+  /import/save     前端確認/微調後 -> write_batch 寫入 books/songs/pages。
+"""
+
+from __future__ import annotations
+
+import uuid
+
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from firebase_admin import firestore as admin_firestore
+
+import firebase_client
+import gemini_service
+import rendering
+from auth_dep import get_uid
+from schemas import (
+    AnalyzeResponse,
+    PageInfo,
+    SaveBookRequest,
+    SaveBookResponse,
+)
 
 load_dotenv()
-
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-if not GEMINI_API_KEY:
-    raise RuntimeError("Missing GEMINI_API_KEY in backend/.env")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-flash-latest")
-
-genai.configure(api_key=GEMINI_API_KEY)
 
 app = FastAPI(title="AI 音樂館員 API")
 app.add_middleware(
     CORSMiddleware,
-    # 開發期允許 iPad 以區網 IP 存取前端
     allow_origins=["*"],
     allow_credentials=False,
     allow_methods=["*"],
@@ -30,140 +38,196 @@ app.add_middleware(
 )
 
 
-def extract_pdf_text(pdf_bytes: bytes) -> str:
-    """Extract text from PDF for fallback/context."""
-    with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
-        pages = [page.get_text("text") for page in doc]
-    return "\n".join(pages).strip()
-
-
-def parse_clean_json(text: str) -> dict[str, Any]:
-    cleaned = text.strip()
-    cleaned = re.sub(r"^```json\s*", "", cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(r"^```\s*", "", cleaned)
-    cleaned = re.sub(r"\s*```$", "", cleaned)
-    return json.loads(cleaned)
-
-
-class ScoreResponse(BaseModel):
-    title: str = Field(min_length=1)
-    composer: str = Field(min_length=1)
-    tags: list[str] = Field(min_length=15, max_length=15)
-    tags_normalized: list[str] = Field(min_length=15, max_length=15)
-
-
-def build_prompt(extracted_text: str) -> str:
-    return f"""
-你是一位博學的音樂館員，請分析使用者上傳的「樂譜 PDF」。
-
-任務要求：
-1) 辨識曲名（title）與作曲家（composer）。
-2) 產出 15 個搜尋關聯標籤 tags（陣列，剛好 15 個，不可重複）。
-3) 標籤必須涵蓋：中文俗名、相關影視或動漫、知名翻唱者、適用演奏氛圍、適用場合。
-4) 嚴禁分析或輸出任何樂理技術細節（例如調性、拍號、和聲分析、速度術語等）。
-5) 若資訊不足，請以合理推測補足，但仍需維持可搜尋性。
-
-你只能輸出乾淨 JSON，不要輸出任何前後文、註解或 markdown code fence。
-
-JSON 格式必須如下：
-{{
-  "title": "字串",
-  "composer": "字串",
-  "tags": ["標籤1", "標籤2", "...共15個"]
-}}
-
-以下是從 PDF 抽出的文字（可能不完整）：
-{extracted_text[:14000]}
-""".strip()
-
-
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-def normalize_tags(raw_tags: list[Any]) -> tuple[list[str], list[str]]:
-    cleaned_tags = [str(tag).strip() for tag in raw_tags if str(tag).strip()]
-    cleaned_tags = list(dict.fromkeys(cleaned_tags))
-    normalized = [tag.lower() for tag in cleaned_tags]
-    normalized = list(dict.fromkeys(normalized))
+@app.post("/import/analyze", response_model=AnalyzeResponse)
+async def analyze_import(
+    files: list[UploadFile] = File(...),
+    scan: bool = Form(True),
+    scan_mode: str = Form("gray"),
+    uid: str = Depends(get_uid),
+) -> AnalyzeResponse:
+    if not files:
+        raise HTTPException(status_code=400, detail="請至少上傳一個檔案。")
 
-    fallback = [
-        "鋼琴獨奏",
-        "抒情",
-        "舞台演出",
-        "比賽選曲",
-        "音樂會",
-        "經典旋律",
-        "療癒",
-        "懷舊",
-        "電影配樂",
-        "動漫",
-        "婚禮",
-        "周杰倫",
-        "經典翻唱",
-        "優雅",
-        "催淚",
-    ]
+    raw_files: list[tuple[str, bytes]] = []
+    for f in files:
+        data = await f.read()
+        if data:
+            raw_files.append((f.content_type or "", data))
 
-    for tag in fallback:
-        if len(cleaned_tags) >= 15:
-            break
-        if tag not in cleaned_tags:
-            cleaned_tags.append(tag)
+    if not raw_files:
+        raise HTTPException(status_code=400, detail="上傳的檔案內容為空。")
 
-    normalized = [tag.lower() for tag in cleaned_tags]
-    normalized = list(dict.fromkeys(normalized))
-    if len(normalized) < 15:
-        for tag in fallback:
-            lowered = tag.lower()
-            if lowered not in normalized:
-                normalized.append(lowered)
-            if len(normalized) >= 15:
-                break
+    scan_mode = scan_mode if scan_mode in ("gray", "bw") else "gray"
 
-    return cleaned_tags[:15], normalized[:15]
-
-
-@app.post("/analyze-score")
-async def analyze_score(file: UploadFile = File(...)) -> ScoreResponse:
-    if file.content_type != "application/pdf":
-        raise HTTPException(status_code=400, detail="請上傳 PDF 檔案。")
-
-    pdf_bytes = await file.read()
-    if not pdf_bytes:
-        raise HTTPException(status_code=400, detail="PDF 檔案內容為空。")
-
-    extracted_text = extract_pdf_text(pdf_bytes)
-    prompt = build_prompt(extracted_text)
-
-    model_name = GEMINI_MODEL.replace("models/", "")
-    model = genai.GenerativeModel(model_name)
     try:
-        response = model.generate_content(
-            [
-                {
-                    "mime_type": "application/pdf",
-                    "data": pdf_bytes,
-                },
-                prompt,
-            ],
-            generation_config={"response_mime_type": "application/json"},
-        )
-        parsed = parse_clean_json(response.text or "{}")
+        pages, source_type = rendering.render_files(raw_files, scan, scan_mode)
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Gemini 解析失敗: {exc}") from exc
+        raise HTTPException(status_code=400, detail=f"檔案解析失敗：{exc}") from exc
 
-    title = str(parsed.get("title", "")).strip()
-    composer = str(parsed.get("composer", "")).strip()
-    tags = parsed.get("tags", [])
-    if not isinstance(tags, list):
-        tags = []
-    final_tags, tags_normalized = normalize_tags(tags)
+    if not pages:
+        raise HTTPException(status_code=400, detail="沒有可處理的頁面。")
 
-    return ScoreResponse(
-        title=title or "未知曲名",
-        composer=composer or "未知作曲家",
-        tags=final_tags,
-        tags_normalized=tags_normalized,
+    book_id = uuid.uuid4().hex
+
+    # 高解析頁圖存 Storage
+    page_infos: list[PageInfo] = []
+    try:
+        for index, page in enumerate(pages, start=1):
+            storage_path = f"users/{uid}/books/{book_id}/pages/{index:04d}.jpg"
+            url = firebase_client.upload_bytes(
+                page.full_jpeg, storage_path, content_type="image/jpeg"
+            )
+            page_infos.append(
+                PageInfo(page_number=index, image_url=url, storage_path=storage_path)
+            )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"頁圖上傳失敗：{exc}") from exc
+
+    # 縮圖丟 Gemini 做結構切分
+    try:
+        analysis = gemini_service.analyze_book([p.thumb_jpeg for p in pages])
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Gemini 切分失敗：{exc}") from exc
+
+    return AnalyzeResponse(
+        book_id=book_id,
+        book_title=analysis.book_title,
+        source_type=source_type,
+        pages=page_infos,
+        songs=analysis.songs,
     )
+
+
+@app.post("/import/save", response_model=SaveBookResponse)
+def save_import(
+    payload: SaveBookRequest, uid: str = Depends(get_uid)
+) -> SaveBookResponse:
+    if not payload.pages:
+        raise HTTPException(status_code=400, detail="缺少頁面資料。")
+    if not payload.songs:
+        raise HTTPException(status_code=400, detail="缺少曲目資料。")
+
+    try:
+        db = firebase_client.get_firestore()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    batch = db.batch()
+    now = admin_firestore.SERVER_TIMESTAMP
+
+    cover_url = payload.cover_url or payload.pages[0].image_url
+
+    # 所有資料寫入該使用者的子集合 users/{uid}/...
+    user_root = db.collection("users").document(uid)
+
+    book_ref = user_root.collection("books").document(payload.book_id)
+    batch.set(
+        book_ref,
+        {
+            "ownerId": uid,
+            "title": payload.book_title,
+            "coverUrl": cover_url,
+            "sourceType": payload.source_type,
+            "pageCount": len(payload.pages),
+            "createdAt": now,
+            "updatedAt": now,
+        },
+    )
+
+    # 建立 page docs，並記錄 pageNumber -> pageId 對照
+    page_id_by_number: dict[int, str] = {}
+    page_ids: list[str] = []
+    for page in payload.pages:
+        page_ref = user_root.collection("pages").document()
+        page_id_by_number[page.page_number] = page_ref.id
+        page_ids.append(page_ref.id)
+        batch.set(
+            page_ref,
+            {
+                "ownerId": uid,
+                "bookId": payload.book_id,
+                "pageNumber": page.page_number,
+                "imageUrl": page.image_url,
+                "storagePath": page.storage_path,
+                "createdAt": now,
+            },
+        )
+
+    # 建立 song docs，pageIds 由起訖頁碼解析
+    song_ids: list[str] = []
+    for order, song in enumerate(payload.songs):
+        start = max(1, song.start_page)
+        end = max(start, song.end_page)
+        song_page_ids = [
+            page_id_by_number[n]
+            for n in range(start, end + 1)
+            if n in page_id_by_number
+        ]
+        tags = [t.strip() for t in song.tags if t and t.strip()]
+        tags_normalized = list(dict.fromkeys(t.lower() for t in tags))
+
+        song_ref = user_root.collection("songs").document()
+        song_ids.append(song_ref.id)
+        batch.set(
+            song_ref,
+            {
+                "ownerId": uid,
+                "bookId": payload.book_id,
+                "bookTitle": payload.book_title,
+                "title": song.title,
+                "composer": song.composer,
+                "tags": tags,
+                "tagsNormalized": tags_normalized,
+                "pageIds": song_page_ids,
+                "startPage": start,
+                "endPage": end,
+                "order": order,
+                "midiUrl": None,
+                "createdAt": now,
+                "updatedAt": now,
+            },
+        )
+
+    try:
+        batch.commit()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"寫入 Firestore 失敗：{exc}") from exc
+
+    return SaveBookResponse(book_id=payload.book_id, song_ids=song_ids, page_ids=page_ids)
+
+
+@app.delete("/account")
+def delete_account(uid: str = Depends(get_uid)) -> dict[str, str]:
+    """刪除使用者的所有資料：Firestore 子集合、Storage 檔案、以及 Auth 帳號。"""
+    from firebase_admin import auth as fb_auth
+
+    try:
+        db = firebase_client.get_firestore()
+        user_root = db.collection("users").document(uid)
+        for sub in ("songs", "pages", "books"):
+            for doc in user_root.collection(sub).stream():
+                doc.reference.delete()
+        user_root.delete()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"刪除 Firestore 資料失敗：{exc}") from exc
+
+    try:
+        bucket = firebase_client.get_bucket()
+        blobs = list(bucket.list_blobs(prefix=f"users/{uid}/"))
+        for blob in blobs:
+            blob.delete()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"刪除 Storage 檔案失敗：{exc}") from exc
+
+    try:
+        fb_auth.delete_user(uid)
+    except Exception:
+        # 帳號可能已不存在，忽略
+        pass
+
+    return {"status": "deleted"}

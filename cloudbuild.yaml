@@ -1,0 +1,19 @@
+# 前端 Cloud Build：把 NEXT_PUBLIC_* 於建置時內嵌，再推到 Artifact Registry
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -t
+      - asia-east1-docker.pkg.dev/$PROJECT_ID/allsheet/frontend:latest
+      - --build-arg=NEXT_PUBLIC_FIREBASE_API_KEY=AIzaSyD8QiJ49g49YsHGdctzPmDJlG2Iv0nGPsw
+      - --build-arg=NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN=sheet-5b247.firebaseapp.com
+      - --build-arg=NEXT_PUBLIC_FIREBASE_PROJECT_ID=sheet-5b247
+      - --build-arg=NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET=sheet-5b247.firebasestorage.app
+      - --build-arg=NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID=404452605737
+      - --build-arg=NEXT_PUBLIC_FIREBASE_APP_ID=1:404452605737:web:f02f15b9d7f55a6fae0138
+      - --build-arg=NEXT_PUBLIC_API_BASE_URL=https://allsheet-api-404452605737.asia-east1.run.app
+      - .
+images:
+  - asia-east1-docker.pkg.dev/$PROJECT_ID/allsheet/frontend:latest
+options:
+  machineType: E2_HIGHCPU_8

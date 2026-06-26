@@ -4,3 +4,7 @@ google-generativeai
 python-multipart
 pymupdf
 python-dotenv
+firebase-admin
+pillow
+opencv-python-headless
+numpy

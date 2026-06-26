@@ -1,0 +1,11 @@
+node_modules/
+.next/
+out/
+backend/
+venv/
+.git/
+.env
+.env.*
+*.tsbuildinfo
+npm-debug.log*
+.DS_Store

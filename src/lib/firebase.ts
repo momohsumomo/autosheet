@@ -1,4 +1,5 @@
 import { FirebaseApp, getApp, getApps, initializeApp } from "firebase/app";
+import { Auth, getAuth } from "firebase/auth";
 import { Firestore, getFirestore } from "firebase/firestore";
 import { FirebaseStorage, getStorage } from "firebase/storage";
 import { appEnv } from "@/lib/env";
@@ -16,5 +17,6 @@ const app: FirebaseApp = getApps().length ? getApp() : initializeApp(firebaseCon
 
 export const db: Firestore = getFirestore(app);
 export const storage: FirebaseStorage = getStorage(app);
+export const auth: Auth = getAuth(app);
 
 export default app;
